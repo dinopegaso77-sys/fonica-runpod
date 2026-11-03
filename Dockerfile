@@ -6,11 +6,12 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel Cython
+RUN pip install --upgrade pip wheel Cython "setuptools<70"
 # torchaudio della stessa versione di torch, così non viene sostituito
 RUN pip install "torchaudio==2.3.1" --index-url https://download.pytorch.org/whl/cu121
 RUN pip install "demucs==4.0.1"
-RUN pip install "openai-whisper==20240930"
+# whisper si costruisce con il setuptools già installato (le versioni nuove non lo compilano)
+RUN pip install --no-build-isolation "openai-whisper==20240930"
 RUN pip install "runpod>=1.6" soundfile
 
 # scarica i modelli dentro l'immagine, così ogni avvio è più rapido
