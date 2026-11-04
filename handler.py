@@ -200,10 +200,22 @@ def handler(job):
         wavs = [w for w in wavs if os.path.basename(w).startswith(("vocals", "bass", "drums", "other")) or not silent(w)]
         runpod.serverless.progress_update(job, "Comprimo le tracce")
         first = int(inp.get("bitrate") or 128)
-        for br in (first, 112, 96, 80, 64):
-            res, total = {}, 0
-            for w in wavs:
-                k = os.path.splitext(os.path.basename(w))[0]
+        # qualità adattata alla durata: le tracce più importanti (voce, basso, chitarra) hanno più qualità
+        try:
+            import soundfile as sf
+            dur = max(1.0, sf.info(wavs[0]).duration)
+        except Exception:
+            dur = 300.0
+        weight = {"vocals": 1.3, "bass": 1.2, "guitar": 1.15, "drums": .9, "piano": .8, "other": .8}
+        names = [os.path.splitext(os.path.basename(w))[0] for w in wavs]
+        wsum = sum(weight.get(k, .8) for k in names) or 1
+        total_kbps = LIMIT * .75 / (dur * 125) * .96  # caratteri base64 -> byte -> kbps disponibili
+        scale = 1.0
+        for _ in range(6):
+            res, total, brs = {}, 0, {}
+            for w, k in zip(wavs, names):
+                br = int(max(32, min(first, total_kbps * weight.get(k, .8) / wsum * scale)))
+                brs[k] = br
                 m = os.path.join(work, f"{k}.m4a")
                 run(["ffmpeg", "-y", "-loglevel", "error", "-i", w, "-c:a", "aac", "-b:a", f"{br}k", m])
                 with open(m, "rb") as fh:
@@ -212,8 +224,10 @@ def handler(job):
                 total += len(b)
             if total < LIMIT:
                 break
+            scale *= .85 * LIMIT / total
         else:
-            return {"error": "brano troppo lungo per una sola richiesta: prova un file più corto"}
+            return {"error": "brano troppo lungo per una sola richiesta (oltre 10 minuti circa): prova un file più corto"}
+        br = max(brs.values())
         return {"stems": res, "format": "m4a", "bitrate": br, "model": model, "gpu": gpu, "note": note,
                 "lyrics": lyrics, "seconds": round(time.time() - t0, 1)}
     except Exception as e:  # il messaggio torna all'app
