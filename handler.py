@@ -15,6 +15,10 @@ Due modi d'uso:
 
 "lyrics" = {"language": "it", "segments": [{"s": 12.4, "e": 15.9, "text": "...",
              "words": [{"w": "parola", "s": 12.4, "e": 12.8}, ...]}, ...]}
+3) Voce da studio (dopo una registrazione)
+   {"input": {"mode": "enhance", "audio_b64": "<voce registrata>", "filename": "voce.webm"}}
+   -> {"voice": "<flac mono base64>", "format": "flac", "seconds": 9.1}
+
 In caso di problemi: {"error": "messaggio"}
 """
 import base64
@@ -55,8 +59,19 @@ def asr_model():
 def run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
-        raise RuntimeError((p.stderr or p.stdout or "errore sconosciuto")[-800:])
+        err = (p.stderr or p.stdout or "errore sconosciuto").strip()
+        print("COMANDO FALLITO:", " ".join(cmd[:4]), "\n", err[-6000:], flush=True)  # nei Logs di RunPod
+        lines = [l.strip() for l in err.splitlines() if l.strip()]
+        raise RuntimeError(" | ".join(lines[-4:])[-700:])
     return p
+
+
+def gpu_name():
+    try:
+        import torch
+        return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "nessuna"
+    except Exception as e:  # solo informativo
+        return "sconosciuta (" + str(e)[:80] + ")"
 
 
 def transcribe(path, language=None, prompt=None):
@@ -110,13 +125,55 @@ def handler(job):
             runpod.serverless.progress_update(job, "Trascrivo il testo dalla voce")
             return {"lyrics": transcribe(src, lang, prompt), "seconds": round(time.time() - t0, 1)}
 
+        # --- voce da studio: toglie la base entrata nel microfono, il rumore e le «s» forti ---
+        if inp.get("mode") == "enhance":
+            gpu = gpu_name()
+            runpod.serverless.progress_update(job, "Pulisco la voce sulla scheda video")
+            wav = os.path.join(work, "voce.wav")
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "2", "-ar", "44100", wav])
+            out = os.path.join(work, "out")
+            base = ["python", "-m", "demucs", "-n", "htdemucs", "--two-stems", "vocals", "-o", out, "--filename", "{stem}.{ext}"]
+            try:
+                run(base + ["-d", "cuda" if gpu != "nessuna" else "cpu", wav])
+            except RuntimeError:
+                shutil.rmtree(out, ignore_errors=True)
+                run(base + ["-d", "cpu", wav])
+            voc = os.path.join(out, "htdemucs", "vocals.wav")
+            if not os.path.exists(voc):
+                return {"error": "Demucs non ha prodotto la voce"}
+            runpod.serverless.progress_update(job, "Rifinisco la voce")
+            flac = os.path.join(work, "voce.flac")
+            # FLAC mono: nessun ritardo aggiunto (la voce resta a tempo) e file piccolo
+            enc = ["-ac", "1", "-ar", "44100", "-c:a", "flac", flac]
+            try:
+                run(["ffmpeg", "-y", "-loglevel", "error", "-i", voc, "-af", "highpass=f=70,afftdn=nf=-30,deesser"] + enc)
+            except RuntimeError:  # ffmpeg senza questi filtri: basta la voce separata
+                run(["ffmpeg", "-y", "-loglevel", "error", "-i", voc] + enc)
+            with open(flac, "rb") as fh:
+                b = base64.b64encode(fh.read()).decode()
+            if len(b) > LIMIT:
+                return {"error": "voce troppo lunga per una sola richiesta"}
+            return {"voice": b, "format": "flac", "gpu": gpu, "seconds": round(time.time() - t0, 1)}
+
         # --- separazione ---
         model = inp.get("model") or "htdemucs"
         if model not in MODELS:
             model = "htdemucs"
+        gpu = gpu_name()
+        print("Scheda video:", gpu, "- modello:", model, flush=True)
         runpod.serverless.progress_update(job, "Separo le tracce sulla scheda video")
         out = os.path.join(work, "out")
-        run(["python", "-m", "demucs", "-n", model, "-o", out, "--filename", "{stem}.{ext}", src])
+        base = ["python", "-m", "demucs", "-n", model, "-o", out, "--filename", "{stem}.{ext}"]
+        note = None
+        try:
+            run(base + ["-d", "cuda" if gpu != "nessuna" else "cpu", src])
+        except RuntimeError as e:
+            # se la scheda video dà problemi, riprova sul processore: più lento ma funziona
+            note = "scheda video %s non utilizzabile (%s): separato sul processore" % (gpu, str(e)[-200:])
+            print(note, flush=True)
+            runpod.serverless.progress_update(job, "La scheda video ha dato un errore: riprovo sul processore (più lento)")
+            shutil.rmtree(out, ignore_errors=True)
+            run(base + ["-d", "cpu", "-j", str(max(1, (os.cpu_count() or 2) - 1)), src])
         wavs = sorted(glob.glob(os.path.join(out, model, "*.wav")))
         if not wavs:
             return {"error": "Demucs non ha prodotto tracce"}
@@ -131,9 +188,19 @@ def handler(job):
                 except Exception as e:  # la separazione resta valida anche se la trascrizione fallisce
                     lyrics = {"error": str(e)[-300:], "segments": []}
 
+        # tracce praticamente mute (per esempio il piano in un brano senza piano): non si inviano
+        def silent(path):
+            try:
+                import soundfile as sf
+                import numpy as np
+                d, _ = sf.read(path, dtype="float32")
+                return float(np.sqrt(np.mean(d * d))) < 0.003
+            except Exception:
+                return False
+        wavs = [w for w in wavs if os.path.basename(w).startswith(("vocals", "bass", "drums", "other")) or not silent(w)]
         runpod.serverless.progress_update(job, "Comprimo le tracce")
         first = int(inp.get("bitrate") or 128)
-        for br in (first, 96, 64):
+        for br in (first, 112, 96, 80, 64):
             res, total = {}, 0
             for w in wavs:
                 k = os.path.splitext(os.path.basename(w))[0]
@@ -147,10 +214,11 @@ def handler(job):
                 break
         else:
             return {"error": "brano troppo lungo per una sola richiesta: prova un file più corto"}
-        return {"stems": res, "format": "m4a", "bitrate": br, "model": model,
+        return {"stems": res, "format": "m4a", "bitrate": br, "model": model, "gpu": gpu, "note": note,
                 "lyrics": lyrics, "seconds": round(time.time() - t0, 1)}
     except Exception as e:  # il messaggio torna all'app
-        return {"error": str(e)[-800:]}
+        print("ERRORE:", repr(e)[-3000:], flush=True)
+        return {"error": str(e)[-700:]}
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
