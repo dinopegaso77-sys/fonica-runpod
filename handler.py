@@ -19,6 +19,12 @@ Due modi d'uso:
    {"input": {"mode": "enhance", "audio_b64": "<voce registrata>", "filename": "voce.webm"}}
    -> {"voice": "<flac mono base64>", "format": "flac", "seconds": 9.1}
 
+4) Chi canta (duetti): riconosce le due voci nella traccia della voce
+   {"input": {"mode": "voices", "audio_b64": "<voce separata>", "filename": "vocals.wav"}}
+   -> {"singers": {"duet": true, "hop": 0.75, "win": 1.5, "k": "0011133222...", "sim": 0.41}, "seconds": 6.2}
+   "k": una cifra ogni "hop" secondi (finestra lunga "win"): 0 = silenzio, 1 = prima voce, 2 = seconda voce, 3 = insieme.
+   Anche la separazione accetta "voices": true e allora risponde anche con "singers".
+
 In caso di problemi: {"error": "messaggio"}
 """
 import base64
@@ -44,6 +50,11 @@ HALLU = re.compile(
 )
 
 _asr = None
+_spk = None
+
+# soglie per riconoscere un duetto (somiglianza coseno fra le due voci medie)
+DUET_SIM = float(os.environ.get("DUET_SIM", "0.72"))
+BOTH_GAP = float(os.environ.get("BOTH_GAP", "0.06"))
 
 
 def asr_model():
@@ -54,6 +65,101 @@ def asr_model():
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         _asr = whisper.load_model(ASR_MODEL, device=dev)
     return _asr
+
+
+def spk_model():
+    """Modello che riconosce le voci (SpeechBrain ECAPA): dà un'impronta di 192 numeri per ogni pezzo di voce."""
+    global _spk
+    if _spk is None:
+        import torch
+        from speechbrain.inference.speaker import EncoderClassifier
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        _spk = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="/models/ecapa",
+                                              run_opts={"device": dev})
+    return _spk
+
+
+def singers(path, work):
+    """Divide la voce in finestre da 1,5 s, ne prende l'impronta e la raggruppa in due cantanti.
+    Le finestre simili a tutte e due le voci sono «insieme»."""
+    import numpy as np
+    import soundfile as sf
+    import torch
+    wav = os.path.join(work, "voci16k.wav")
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", path, "-ac", "1", "-ar", "16000", wav])
+    x, sr = sf.read(wav, dtype="float32")
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    win, hop = 1.5, 0.75
+    n, h = int(win * sr), int(hop * sr)
+    if len(x) < n:
+        return {"duet": False, "hop": hop, "win": win, "k": "", "why": "voce troppo corta"}
+    starts = list(range(0, len(x) - n + 1, h))
+    rms = np.array([float(np.sqrt(np.mean(x[s0:s0 + n] ** 2))) for s0 in starts])
+    thr = max(0.006, 0.18 * float(np.percentile(rms, 90)))
+    act = np.where(rms > thr)[0]
+    k = np.zeros(len(starts), dtype=int)
+    if len(act) < 16:
+        return {"duet": False, "hop": hop, "win": win, "k": "".join(map(str, k)), "why": "poca voce"}
+    m = spk_model()
+    emb = []
+    with torch.no_grad():
+        for b in range(0, len(act), 64):
+            ids = act[b:b + 64]
+            batch = torch.from_numpy(np.stack([x[starts[i]:starts[i] + n] for i in ids]))
+            e = m.encode_batch(batch.to(m.device)).squeeze(1).float().cpu().numpy()
+            emb.append(e)
+    E = np.concatenate(emb, 0)
+    E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-9
+    # due gruppi (k-means sul coseno), partendo dalle due finestre più lontane
+    mu = E.mean(0)
+    a = int(np.argmin(E @ mu))
+    b2 = int(np.argmin(E @ E[a]))
+    C = np.stack([E[a], E[b2]])
+    for _ in range(30):
+        S = E @ C.T
+        lab = S.argmax(1)
+        newC = []
+        for j in range(2):
+            v = E[lab == j].mean(0) if np.any(lab == j) else C[j]
+            newC.append(v / (np.linalg.norm(v) + 1e-9))
+        newC = np.stack(newC)
+        if np.allclose(newC, C, atol=1e-5):
+            break
+        C = newC
+    # rifinitura: le voci medie si calcolano solo sui pezzi sicuri, così i pezzi cantati insieme non le sporcano
+    for _ in range(4):
+        S = E @ C.T
+        lab = S.argmax(1)
+        gap = np.abs(S[:, 0] - S[:, 1])
+        sure = gap > np.percentile(gap, 35)
+        newC = []
+        for j in range(2):
+            sel = (lab == j) & sure
+            v = E[sel].mean(0) if np.any(sel) else C[j]
+            newC.append(v / (np.linalg.norm(v) + 1e-9))
+        C = np.stack(newC)
+    S = E @ C.T
+    lab = S.argmax(1)
+    sim = float(C[0] @ C[1])
+    minor = float(min(np.mean(lab == 0), np.mean(lab == 1)))
+    duet = sim < DUET_SIM and minor >= 0.1
+    if not duet:
+        k[act] = 1
+        return {"duet": False, "hop": hop, "win": win, "k": "".join(map(str, k)), "sim": round(sim, 3), "minor": round(minor, 3)}
+    # «insieme»: il pezzo somiglia quasi allo stesso modo a tutte e due le voci
+    both = (np.abs(S[:, 0] - S[:, 1]) < max(BOTH_GAP, 0.22 * (1 - sim))) & (S.min(1) > 0.3)
+    lab2 = np.where(both, 2, lab)  # 0 / 1 = voci, 2 = insieme
+    # pulizia: una finestra isolata prende il valore delle vicine
+    for i in range(1, len(lab2) - 1):
+        if lab2[i - 1] == lab2[i + 1] != lab2[i] and act[i + 1] - act[i - 1] == 2:
+            lab2[i] = lab2[i - 1]
+    # la prima voce che canta da sola è la «1»
+    first = next((int(v) for v in lab2 if v in (0, 1)), 0)
+    ren = {first: 1, 1 - first: 2, 2: 3}
+    for i, w in enumerate(act):
+        k[w] = ren[int(lab2[i])]
+    return {"duet": True, "hop": hop, "win": win, "k": "".join(map(str, k)), "sim": round(sim, 3), "minor": round(minor, 3)}
 
 
 def run(cmd):
@@ -125,6 +231,11 @@ def handler(job):
             runpod.serverless.progress_update(job, "Trascrivo il testo dalla voce")
             return {"lyrics": transcribe(src, lang, prompt), "seconds": round(time.time() - t0, 1)}
 
+        # --- chi canta: riconosce le due voci dei duetti ---
+        if inp.get("mode") == "voices":
+            runpod.serverless.progress_update(job, "Riconosco le voci")
+            return {"singers": singers(src, work), "seconds": round(time.time() - t0, 1)}
+
         # --- voce da studio: toglie la base entrata nel microfono, il rumore e le «s» forti ---
         if inp.get("mode") == "enhance":
             gpu = gpu_name()
@@ -188,6 +299,17 @@ def handler(job):
                 except Exception as e:  # la separazione resta valida anche se la trascrizione fallisce
                     lyrics = {"error": str(e)[-300:], "segments": []}
 
+        sing = None
+        if inp.get("voices"):
+            voc = os.path.join(out, model, "vocals.wav")
+            if os.path.exists(voc):
+                runpod.serverless.progress_update(job, "Riconosco le voci (duetti)")
+                try:
+                    sing = singers(voc, work)
+                except Exception as e:  # la separazione resta valida
+                    print("voci non riconosciute:", repr(e)[-500:], flush=True)
+                    sing = {"error": str(e)[-300:]}
+
         # tracce praticamente mute (per esempio il piano in un brano senza piano): non si inviano
         def silent(path):
             try:
@@ -229,7 +351,7 @@ def handler(job):
             return {"error": "brano troppo lungo per una sola richiesta (oltre 10 minuti circa): prova un file più corto"}
         br = max(brs.values())
         return {"stems": res, "format": "m4a", "bitrate": br, "model": model, "gpu": gpu, "note": note,
-                "lyrics": lyrics, "seconds": round(time.time() - t0, 1)}
+                "lyrics": lyrics, "singers": sing, "seconds": round(time.time() - t0, 1)}
     except Exception as e:  # il messaggio torna all'app
         print("ERRORE:", repr(e)[-3000:], flush=True)
         return {"error": str(e)[-700:]}

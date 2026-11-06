@@ -13,10 +13,13 @@ RUN pip install "demucs==4.0.1"
 # whisper si costruisce con il setuptools già installato (le versioni nuove non lo compilano)
 RUN pip install --no-build-isolation "openai-whisper==20240930"
 RUN pip install "runpod>=1.6" soundfile
+# riconoscimento delle voci per i duetti (SpeechBrain ECAPA)
+RUN pip install "speechbrain==1.0.3" "huggingface_hub>=0.20,<0.27"
 
 # scarica i modelli dentro l'immagine, così ogni avvio è più rapido
 RUN python -c "from demucs.pretrained import get_model; [get_model(n) for n in ('htdemucs','htdemucs_6s','htdemucs_ft')]"
 RUN python -c "import whisper; whisper.load_model('turbo', device='cpu')"
+RUN python -c "from speechbrain.inference.speaker import EncoderClassifier; EncoderClassifier.from_hparams(source='speechbrain/spkrec-ecapa-voxceleb', savedir='/models/ecapa')"
 
 COPY handler.py /handler.py
 CMD ["python", "-u", "/handler.py"]
