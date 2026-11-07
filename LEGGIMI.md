@@ -38,3 +38,4 @@ La chiave resta solo nel tuo browser. Non condividerla con nessuno.
 - Modelli: `htdemucs` (4 tracce), `htdemucs_6s` (anche chitarra e piano), `htdemucs_ft` (qualità più alta).
 - Whisper: modello `turbo`, modificabile con la variabile d'ambiente `WHISPER_MODEL`.
 - Duetti: il riconoscimento delle voci usa SpeechBrain ECAPA (`speechbrain/spkrec-ecapa-voxceleb`). Le soglie si possono cambiare con le variabili `DUET_SIM` (0.72: più bassa = meno brani riconosciuti come duetto) e `BOTH_GAP` (0.06: più alta = più righe «insieme»).
+- Tonalità: la modalità `shift` sposta di semitoni le tracce già separate con il filtro `rubberband` di ffmpeg (la voce conserva il suo timbro). L'app chiede da −3 a +3 toni (da −6 a +6 semitoni) e salva le tracce pronte con il brano: il browser non deve più calcolare niente quando si cambia tonalità. Lavora sul processore, non serve la scheda video.

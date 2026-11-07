@@ -21,9 +21,17 @@ Due modi d'uso:
 
 4) Chi canta (duetti): riconosce le due voci nella traccia della voce
    {"input": {"mode": "voices", "audio_b64": "<voce separata>", "filename": "vocals.wav"}}
-   -> {"singers": {"duet": true, "hop": 0.75, "win": 1.5, "k": "0011133222...", "sim": 0.41}, "seconds": 6.2}
+   -> {"singers": {"v": 2, "duet": true, "hop": 0.75, "win": 1.5, "k": "0011133222...", "sim": 0.41,
+       "act": [indici delle finestre con voce], "emb": "<impronte int8, 'd' numeri per finestra attiva>", "qs": scala,
+       "f0": [Hz], "poly": [0-100], "rms": [0-1000]}, "seconds": 6.2}
    "k": una cifra ogni "hop" secondi (finestra lunga "win"): 0 = silenzio, 1 = prima voce, 2 = seconda voce, 3 = insieme.
+   L'app usa impronte, altezza e polifonia per decidere riga per riga e per ricalcolare dopo le correzioni a mano.
    Anche la separazione accetta "voices": true e allora risponde anche con "singers".
+
+5) Tonalità pronte: sposta di semitoni le tracce già separate (nessuna nuova separazione)
+   {"input": {"mode": "shift", "files": [{"name": "vocals.m4a", "b64": "..."}, ...], "semis": [-1, 1, -2]}}
+   -> {"shift": {"-1": {"vocals": "<m4a base64>", ...}, "1": {...}}, "format": "m4a", "seconds": 20.4}
+   La voce mantiene il suo timbro (formanti conservate); ogni traccia esce con la stessa qualità con cui è arrivata.
 
 In caso di problemi: {"error": "messaggio"}
 """
@@ -79,9 +87,69 @@ def spk_model():
     return _spk
 
 
+def _yin(f, sr, fmin=70.0, fmax=1000.0):
+    """Altezza (Hz) e aperiodicità (0 = una nota pulita, alta = più note o rumore) di un pezzetto di voce."""
+    import numpy as np
+    x = f.astype(np.float64) - float(f.mean())
+    W = len(x) // 2
+    lo, hi = int(sr / fmax), min(int(sr / fmin), W)
+    N = 1 << int(np.ceil(np.log2(2 * len(x))))
+    r = np.fft.irfft(np.conj(np.fft.rfft(x[:W], N)) * np.fft.rfft(x, N), N)[:hi + 2]
+    cs = np.concatenate([[0.0], np.cumsum(x * x)])
+    tau = np.arange(hi + 2)
+    d = cs[W] + (cs[tau + W] - cs[tau]) - 2 * r
+    d[0] = 0
+    cm = np.cumsum(d[1:])
+    dn = np.ones_like(d)
+    dn[1:] = d[1:] * np.arange(1, len(d)) / np.maximum(cm, 1e-12)
+    seg = dn[lo:hi + 1]
+    cand = np.where((seg[1:-1] < 0.2) & (seg[1:-1] <= seg[:-2]) & (seg[1:-1] <= seg[2:]))[0]
+    i = (cand[0] + 1) if len(cand) else int(np.argmin(seg))
+    t = i + lo
+    return sr / t, float(dn[t])
+
+
+def pitch_feats(x, sr, starts, n):
+    """Per ogni finestra: altezza della voce principale (Hz) e «polifonia» (0-1).
+    Polifonia = quanta energia NON sta sulle armoniche della nota principale, insieme all'aperiodicità:
+    una voce sola dà valori bassi, due voci con note diverse valori alti, un coro sotto valori medi."""
+    import numpy as np
+    fr, hp, nfft = 2048, 1024, 4096
+    df = sr / nfft
+    fq = np.arange(nfft // 2 + 1) * df
+    band = (fq >= 70) & (fq <= 4000)
+    win = np.hanning(fr)
+    f0s, polys = [], []
+    for s0 in starts:
+        seg = x[s0:s0 + n]
+        frames = [seg[i:i + fr] for i in range(0, len(seg) - fr + 1, hp)]
+        e = np.array([float(np.sqrt(np.mean(f * f))) for f in frames]) if frames else np.zeros(0)
+        if not len(frames) or e.max() < 1e-4:
+            f0s.append(0); polys.append(0.0); continue
+        F, P = [], []
+        for f, en in zip(frames, e):
+            if en < 0.35 * e.max():
+                continue
+            f0, ap = _yin(f, sr)
+            pw = np.abs(np.fft.rfft(f * win, nfft)) ** 2
+            tot = float(pw[band].sum()) or 1e-12
+            hmask = np.zeros_like(band)
+            hn = int(4000 // f0)
+            for h in range(1, hn + 1):
+                c = h * f0
+                w = max(1.5 * df, 0.03 * c)
+                hmask |= np.abs(fq - c) <= w
+            hf = float(pw[band & hmask].sum()) / tot
+            F.append(f0); P.append(0.5 * (1 - hf) + 0.5 * min(1.0, ap))
+        f0s.append(int(round(float(np.median(F)))) if F else 0)
+        polys.append(float(np.median(P)) if P else 0.0)
+    return f0s, polys
+
+
 def singers(path, work):
-    """Divide la voce in finestre da 1,5 s, ne prende l'impronta e la raggruppa in due cantanti.
-    Le finestre simili a tutte e due le voci sono «insieme»."""
+    """Divide la voce in finestre da 1,5 s e per ognuna calcola: l'impronta della voce (SpeechBrain ECAPA),
+    l'altezza e la polifonia. Raggruppa in due cantanti e manda all'app anche i dati di ogni finestra,
+    così l'app decide riga per riga e si corregge da sola dopo poche correzioni a mano."""
     import numpy as np
     import soundfile as sf
     import torch
@@ -93,14 +161,14 @@ def singers(path, work):
     win, hop = 1.5, 0.75
     n, h = int(win * sr), int(hop * sr)
     if len(x) < n:
-        return {"duet": False, "hop": hop, "win": win, "k": "", "why": "voce troppo corta"}
+        return {"v": 2, "duet": False, "hop": hop, "win": win, "k": "", "why": "voce troppo corta"}
     starts = list(range(0, len(x) - n + 1, h))
     rms = np.array([float(np.sqrt(np.mean(x[s0:s0 + n] ** 2))) for s0 in starts])
     thr = max(0.006, 0.18 * float(np.percentile(rms, 90)))
     act = np.where(rms > thr)[0]
     k = np.zeros(len(starts), dtype=int)
     if len(act) < 16:
-        return {"duet": False, "hop": hop, "win": win, "k": "".join(map(str, k)), "why": "poca voce"}
+        return {"v": 2, "duet": False, "hop": hop, "win": win, "k": "".join(map(str, k)), "why": "poca voce"}
     m = spk_model()
     emb = []
     with torch.no_grad():
@@ -111,6 +179,7 @@ def singers(path, work):
             emb.append(e)
     E = np.concatenate(emb, 0)
     E /= np.linalg.norm(E, axis=1, keepdims=True) + 1e-9
+    f0s, polys = pitch_feats(x, sr, [starts[i] for i in act], n)
     # due gruppi (k-means sul coseno), partendo dalle due finestre più lontane
     mu = E.mean(0)
     a = int(np.argmin(E @ mu))
@@ -127,12 +196,14 @@ def singers(path, work):
         if np.allclose(newC, C, atol=1e-5):
             break
         C = newC
-    # rifinitura: le voci medie si calcolano solo sui pezzi sicuri, così i pezzi cantati insieme non le sporcano
+    # rifinitura: le voci medie si calcolano solo sui pezzi sicuri e poco polifonici,
+    # così i pezzi cantati insieme e i cori non le sporcano
+    P = np.array(polys)
     for _ in range(4):
         S = E @ C.T
         lab = S.argmax(1)
         gap = np.abs(S[:, 0] - S[:, 1])
-        sure = gap > np.percentile(gap, 35)
+        sure = (gap > np.percentile(gap, 35)) & (P <= np.percentile(P, 70))
         newC = []
         for j in range(2):
             sel = (lab == j) & sure
@@ -143,23 +214,33 @@ def singers(path, work):
     lab = S.argmax(1)
     sim = float(C[0] @ C[1])
     minor = float(min(np.mean(lab == 0), np.mean(lab == 1)))
-    duet = sim < DUET_SIM and minor >= 0.1
-    if not duet:
-        k[act] = 1
-        return {"duet": False, "hop": hop, "win": win, "k": "".join(map(str, k)), "sim": round(sim, 3), "minor": round(minor, 3)}
-    # «insieme»: il pezzo somiglia quasi allo stesso modo a tutte e due le voci
+    F0 = np.array(f0s, dtype=float)
+    def med(j):
+        v = F0[(lab == j) & (F0 > 0)]
+        return float(np.median(v)) if len(v) else 0.0
+    fa, fb = med(0), med(1)
+    split = abs(12 * np.log2(fa / fb)) if fa > 0 and fb > 0 else 0.0  # semitoni fra le due voci
+    duet = minor >= 0.1 and (sim < DUET_SIM or (split >= 4 and sim < 0.85))
     both = (np.abs(S[:, 0] - S[:, 1]) < max(BOTH_GAP, 0.22 * (1 - sim))) & (S.min(1) > 0.3)
-    lab2 = np.where(both, 2, lab)  # 0 / 1 = voci, 2 = insieme
-    # pulizia: una finestra isolata prende il valore delle vicine
-    for i in range(1, len(lab2) - 1):
-        if lab2[i - 1] == lab2[i + 1] != lab2[i] and act[i + 1] - act[i - 1] == 2:
-            lab2[i] = lab2[i - 1]
-    # la prima voce che canta da sola è la «1»
+    lab2 = np.where(both, 2, lab)
     first = next((int(v) for v in lab2 if v in (0, 1)), 0)
     ren = {first: 1, 1 - first: 2, 2: 3}
     for i, w in enumerate(act):
-        k[w] = ren[int(lab2[i])]
-    return {"duet": True, "hop": hop, "win": win, "k": "".join(map(str, k)), "sim": round(sim, 3), "minor": round(minor, 3)}
+        k[w] = ren[int(lab2[i])] if duet else 1
+    # dati di ogni finestra per l'app: impronta ridotta a 64 numeri da un byte, altezza, polifonia, volume
+    D = 64
+    Cm = E.mean(0)
+    U, Sv, Vt = np.linalg.svd(E - Cm, full_matrices=False)
+    D = min(D, Vt.shape[0])
+    Z = (E - Cm) @ Vt[:D].T
+    sc = float(np.abs(Z).max()) or 1.0
+    q = np.clip(np.round(Z / sc * 127), -127, 127).astype(np.int8)
+    return {"v": 2, "duet": bool(duet), "hop": hop, "win": win, "k": "".join(map(str, k)), "sim": round(sim, 3),
+            "minor": round(minor, 3), "split": round(split, 1),
+            "act": [int(i) for i in act], "d": D, "qs": round(sc / 127, 6),
+            "emb": base64.b64encode(q.tobytes()).decode(),
+            "f0": [int(v) for v in f0s], "poly": [int(round(v * 100)) for v in polys],
+            "rms": [int(round(min(1.0, rms[i] / (rms.max() or 1)) * 1000)) for i in act]}
 
 
 def run(cmd):
@@ -210,8 +291,80 @@ def transcribe(path, language=None, prompt=None):
     return {"language": res.get("language"), "segments": segs}
 
 
+def _kbps(path):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=bit_rate", "-of", "default=nw=1:nk=1", path],
+                           capture_output=True, text=True, timeout=60)
+        return int(int(r.stdout.strip().split()[0]) / 1000)
+    except Exception:
+        return 96
+
+
+def _shift_one(wav, dst, ratio, br, voice):
+    enc = ["-c:a", "aac", "-b:a", "%dk" % br, dst]
+    filters = ["rubberband=pitch=%.6f:pitchq=quality%s" % (ratio, ":formant=preserved" if voice else ""),
+               "rubberband=pitch=%.6f" % ratio,
+               # ultima riserva se ffmpeg non ha rubberband: cambia velocità e la riporta a tempo
+               "asetrate=44100*%.6f,aresample=44100,atempo=%.6f" % (ratio, 1 / ratio)]
+    last = None
+    for f in filters:
+        try:
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", wav, "-af", f] + enc)
+            return
+        except RuntimeError as e:
+            last = e
+    raise last
+
+
+def shift(job, inp):
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = time.time()
+    work = tempfile.mkdtemp()
+    try:
+        files = inp.get("files") or []
+        semis = [int(x) for x in (inp.get("semis") or []) if int(x) and -12 <= int(x) <= 12]
+        if not files or not semis:
+            return {"error": "mancano le tracce o i semitoni"}
+        runpod.serverless.progress_update(job, "Preparo le tracce")
+        src = []
+        for f in files:
+            k = re.sub(r"[^a-z0-9_]", "", os.path.splitext(os.path.basename(f.get("name") or "x"))[0].lower()) or "x"
+            ext = os.path.splitext(f.get("name") or "")[1].lower() or ".m4a"
+            p = os.path.join(work, k + ext)
+            with open(p, "wb") as fh:
+                fh.write(base64.b64decode(f.get("b64") or ""))
+            wav = os.path.join(work, k + ".wav")
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", p, "-ar", "44100", wav])
+            src.append((k, wav, max(32, min(160, _kbps(p)))))
+        tasks = [(k, wav, br, s) for s in semis for (k, wav, br) in src]
+        runpod.serverless.progress_update(job, "Cambio tonalità a %d tracce" % len(tasks))
+
+        def one(t):
+            k, wav, br, s = t
+            dst = os.path.join(work, "%s_%d.m4a" % (k, s))
+            _shift_one(wav, dst, 2 ** (s / 12.0), br, k == "vocals")
+            return t, dst
+        out, total = {}, 0
+        with ThreadPoolExecutor(max_workers=max(1, min(len(tasks), os.cpu_count() or 2))) as ex:
+            for (k, wav, br, s), dst in ex.map(one, tasks):
+                with open(dst, "rb") as fh:
+                    b = base64.b64encode(fh.read()).decode()
+                total += len(b)
+                out.setdefault(str(s), {})[k] = b
+        if total > LIMIT:
+            return {"error": "TROPPO: risposta troppo grande, chiedi meno semitoni per volta"}
+        return {"shift": out, "format": "m4a", "seconds": round(time.time() - t0, 1)}
+    except Exception as e:
+        print("ERRORE:", repr(e)[-3000:], flush=True)
+        return {"error": str(e)[-700:]}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def handler(job):
     inp = job.get("input") or {}
+    if inp.get("mode") == "shift":
+        return shift(job, inp)
     data = inp.get("audio_b64")
     if not data:
         return {"error": "manca il file audio"}
