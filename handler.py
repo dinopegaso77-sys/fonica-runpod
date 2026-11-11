@@ -365,6 +365,10 @@ def handler(job):
     inp = job.get("input") or {}
     if inp.get("mode") == "shift":
         return shift(job, inp)
+    if inp.get("mode") == "video":
+        # video finale: i file passano dal cloud R2 dell'utente (indirizzi firmati), non dentro la richiesta
+        from video import video_job
+        return video_job(job, inp, lambda m: runpod.serverless.progress_update(job, m))
     data = inp.get("audio_b64")
     if not data:
         return {"error": "manca il file audio"}

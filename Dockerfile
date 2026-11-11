@@ -21,5 +21,17 @@ RUN python -c "from demucs.pretrained import get_model; [get_model(n) for n in (
 RUN python -c "import whisper; whisper.load_model('turbo', device='cpu')"
 RUN python -c "from speechbrain.inference.speaker import EncoderClassifier; EncoderClassifier.from_hparams(source='speechbrain/spkrec-ecapa-voxceleb', savedir='/models/ecapa')"
 
+# video finale: sfondo e trucco con MediaPipe (stessi modelli dell'app), disegno con OpenCV e Pillow
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 curl fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install "numpy<2" "mediapipe==0.10.14" "jax<0.4.31" "jaxlib<0.4.31" "opencv-contrib-python<4.11" "opencv-python-headless<4.11" pillow
+RUN mkdir -p /models/mp /models/fonts \
+    && curl -fsSL -o /models/mp/selfie_segmenter.tflite https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite \
+    && curl -fsSL -o /models/mp/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task \
+    && curl -fsSL -o /models/fonts/JosefinSans.ttf "https://github.com/google/fonts/raw/main/ofl/josefinsans/JosefinSans%5Bwght%5D.ttf" \
+    && curl -fsSL -o /models/fonts/Figtree.ttf "https://github.com/google/fonts/raw/main/ofl/figtree/Figtree%5Bwght%5D.ttf"
+RUN python -c "import mediapipe, cv2, PIL; from mediapipe.tasks.python import vision; print('video ok', mediapipe.__version__, cv2.__version__)"
+
+COPY video.py /video.py
 COPY handler.py /handler.py
 CMD ["python", "-u", "/handler.py"]
