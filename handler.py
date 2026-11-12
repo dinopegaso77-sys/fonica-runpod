@@ -29,6 +29,9 @@ Due modi d'uso:
    Anche la separazione accetta "voices": true e allora risponde anche con "singers".
 
 5) Tonalità pronte: sposta di semitoni le tracce già separate (nessuna nuova separazione)
+   {"input": {"mode": "tone", "audio_url": "<traccia della chitarra o del basso, indirizzo firmato R2>", "role": "chitarra", "bpm": 130}}
+   → suoni del brano (distorsione, delay, riverbero, curva delle frequenze) pronti per la pedaliera
+
    {"input": {"mode": "shift", "files": [{"name": "vocals.m4a", "b64": "..."}, ...], "semis": [-1, 1, -2]}}
    -> {"shift": {"-1": {"vocals": "<m4a base64>", ...}, "1": {...}}, "format": "m4a", "seconds": 20.4}
    La voce mantiene il suo timbro (formanti conservate); ogni traccia esce con la stessa qualità con cui è arrivata.
@@ -365,6 +368,10 @@ def handler(job):
     inp = job.get("input") or {}
     if inp.get("mode") == "shift":
         return shift(job, inp)
+    if inp.get("mode") == "tone":
+        # «Copia il suono del brano»: analisi della traccia di chitarra o basso (solo calcolo, niente modelli)
+        from tone import tone_job
+        return tone_job(job, inp, lambda m: runpod.serverless.progress_update(job, m))
     if inp.get("mode") == "video":
         # video finale: i file passano dal cloud R2 dell'utente (indirizzi firmati), non dentro la richiesta
         from video import video_job

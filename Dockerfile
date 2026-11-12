@@ -33,5 +33,6 @@ RUN mkdir -p /models/mp /models/fonts \
 RUN python -c "import mediapipe, cv2, PIL; from mediapipe.tasks.python import vision; print('video ok', mediapipe.__version__, cv2.__version__)"
 
 COPY video.py /video.py
+COPY tone.py /tone.py
 COPY handler.py /handler.py
 CMD ["python", "-u", "/handler.py"]
