@@ -301,17 +301,25 @@ def static_layers(P, W, H):
     u = min(W, H)
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     if P.get("logo_b64") and not P.get("nologo"):
+        # logo sempre in alto a sinistra, su un rettangolo nero con un filo azzurro: si legge su qualunque sfondo
         try:
             lg = Image.open(io.BytesIO(base64.b64decode(P["logo_b64"]))).convert("RGBA")
-            lw = u * .16
-            lh = lw * lg.height / lg.width
-            x0, y0 = u * .04, H - u * .04 - lh
-            box = Image.new("RGBA", (int(lw + 12), int(lh + 12)), (255, 255, 255, int(255 * .9 * .9)))
-            img.alpha_composite(box, (int(x0 - 6), int(y0 - 6)))
-            lg = lg.resize((max(1, int(lw)), max(1, int(lh))), Image.LANCZOS)
-            a = lg.split()[3].point(lambda v: int(v * .9))
-            lg.putalpha(a)
-            img.alpha_composite(lg, (int(x0), int(y0)))
+            lw = round(u * .22)
+            lh = round(lw * lg.height / lg.width)
+            pad = max(5, round(u * .012))
+            x0 = y0 = round(u * .035)
+            box = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            d = ImageDraw.Draw(box)
+            sh = Image.new("L", (W, H), 0)
+            ImageDraw.Draw(sh).rounded_rectangle((x0 - pad, y0 - pad, x0 + lw + pad, y0 + lh + pad), radius=pad * 1.4, fill=150)
+            sh = sh.filter(ImageFilter.GaussianBlur(max(2, u * .01)))
+            shadow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            shadow.putalpha(sh)
+            img.alpha_composite(shadow)
+            d.rounded_rectangle((x0 - pad, y0 - pad, x0 + lw + pad, y0 + lh + pad), radius=pad * 1.4, fill=(0, 0, 0, 255),
+                                outline=(111, 227, 255, 140), width=max(1, round(u * .003)))
+            img.alpha_composite(box)
+            img.alpha_composite(lg.resize((max(1, lw), max(1, lh)), Image.LANCZOS), (x0, y0))
         except Exception as e:
             print("logo:", e, flush=True)
     title = (P.get("title") or "").strip()
