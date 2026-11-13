@@ -4,7 +4,7 @@ Due modi d'uso:
 
 1) Separazione (con trascrizione facoltativa)
    {"input": {"audio_b64": "...", "filename": "brano.mp3",
-              "model": "htdemucs" | "htdemucs_6s" | "htdemucs_ft", "bitrate": 128,
+              "model": "htdemucs" | "htdemucs_6s" | "htdemucs_ft" | "mix6", "bitrate": 128,
               "transcribe": true, "language": "it" | "" , "prompt": "testo noto (facoltativo)"}}
    -> {"stems": {"vocals": "<m4a base64>", ...}, "format": "m4a", "bitrate": 128,
        "lyrics": {...} | null, "seconds": 41.2}
@@ -49,7 +49,7 @@ import time
 
 import runpod
 
-MODELS = {"htdemucs", "htdemucs_6s", "htdemucs_ft"}
+MODELS = {"htdemucs", "htdemucs_6s", "htdemucs_ft", "mix6"}  # mix6: 6 tracce, con voce, basso e batteria rifatti dal modello più preciso
 LIMIT = 18_500_000  # caratteri base64 in uscita: RunPod accetta circa 20 MB per risposta
 ASR_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
 
@@ -438,24 +438,41 @@ def handler(job):
         print("Scheda video:", gpu, "- modello:", model, flush=True)
         runpod.serverless.progress_update(job, "Separo le tracce sulla scheda video")
         out = os.path.join(work, "out")
-        base = ["python", "-m", "demucs", "-n", model, "-o", out, "--filename", "{stem}.{ext}"]
+        hybrid = model == "mix6"
+        mdir = "htdemucs_6s" if hybrid else model
+        base = ["python", "-m", "demucs", "-n", mdir, "-o", out, "--filename", "{stem}.{ext}"]
         note = None
+        dev = "cuda" if gpu != "nessuna" else "cpu"
         try:
-            run(base + ["-d", "cuda" if gpu != "nessuna" else "cpu", src])
+            run(base + ["-d", dev, src])
         except RuntimeError as e:
             # se la scheda video dà problemi, riprova sul processore: più lento ma funziona
             note = "scheda video %s non utilizzabile (%s): separato sul processore" % (gpu, str(e)[-200:])
             print(note, flush=True)
             runpod.serverless.progress_update(job, "La scheda video ha dato un errore: riprovo sul processore (più lento)")
             shutil.rmtree(out, ignore_errors=True)
+            dev = "cpu"
             run(base + ["-d", "cpu", "-j", str(max(1, (os.cpu_count() or 2) - 1)), src])
-        wavs = sorted(glob.glob(os.path.join(out, model, "*.wav")))
+        if hybrid:
+            # secondo passaggio con il modello più preciso: voce, basso e batteria più puliti
+            # (per esempio la cassa che resta nel basso); chitarra, piano e altro restano dal primo
+            runpod.serverless.progress_update(job, "Rifinisco voce, basso e batteria (secondo passaggio)")
+            try:
+                run(["python", "-m", "demucs", "-n", "htdemucs_ft", "-o", out, "--filename", "{stem}.{ext}", "-d", dev, src])
+                for k in ("vocals", "bass", "drums"):
+                    p2 = os.path.join(out, "htdemucs_ft", k + ".wav")
+                    if os.path.exists(p2):
+                        shutil.copyfile(p2, os.path.join(out, mdir, k + ".wav"))
+            except RuntimeError as e:
+                note = (note + "; " if note else "") + "secondo passaggio non riuscito, restano le 6 tracce normali"
+                print("mix6:", str(e)[-300:], flush=True)
+        wavs = sorted(glob.glob(os.path.join(out, mdir, "*.wav")))
         if not wavs:
             return {"error": "Demucs non ha prodotto tracce"}
 
         lyrics = None
         if inp.get("transcribe"):
-            voc = os.path.join(out, model, "vocals.wav")
+            voc = os.path.join(out, mdir, "vocals.wav")
             if os.path.exists(voc):
                 runpod.serverless.progress_update(job, "Trascrivo il testo dalla voce")
                 try:
@@ -465,7 +482,7 @@ def handler(job):
 
         sing = None
         if inp.get("voices"):
-            voc = os.path.join(out, model, "vocals.wav")
+            voc = os.path.join(out, mdir, "vocals.wav")
             if os.path.exists(voc):
                 runpod.serverless.progress_update(job, "Riconosco le voci (duetti)")
                 try:

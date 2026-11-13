@@ -106,6 +106,32 @@ def drive_score(crest, flat, dyn, role):
 
 
 FL0, FL1 = 0.2, 0.5
+def bass_feats(seg):
+    """basso: la distorsione accende le frequenze alte per tutta la durata delle note;
+    la batteria rimasta nella traccia le accende solo a colpi brevi (cassa, rullante, piatti).
+    Per questo la misura usa la mediana fotogramma per fotogramma, che ignora i colpi,
+    e la «puntualità» delle frequenze alte per riconoscere la batteria."""
+    n, hop = 1024, 256
+    F = frames(seg, n, hop) * np.hanning(n)
+    P = np.abs(np.fft.rfft(F, axis=1)) ** 2
+    fq = np.fft.rfftfreq(n, 1 / SR)
+    lo = P[:, (fq >= 40) & (fq < 400)].sum(1) + EPS
+    hi = P[:, (fq >= 1500) & (fq < 6000)].sum(1) + EPS
+    keep = lo > np.percentile(lo, 30)
+    r = 10 * np.log10(hi[keep] / lo[keep]) if keep.any() else np.array([-60.0])
+    ratio = float(np.median(r))
+    hd = 10 * np.log10(hi)
+    spike = float(np.percentile(hd, 95) - np.median(hd))
+    mean_r = float(10 * np.log10(hi[keep].sum() / lo[keep].sum())) if keep.any() else ratio
+    return ratio, spike, mean_r
+
+
+def bass_score(crest, ratio):
+    s_r = np.clip((ratio + 34) / 22, 0, 1)
+    s_c = np.clip((14.5 - crest) / 7.0, 0, 1)
+    return float(np.clip(0.8 * s_r + 0.2 * s_c * s_r, 0, 1))
+
+
 CUT = {"chitarra": (0.14, 0.45, 0.75), "basso": (0.2, 0.5, 0.8)}
 
 
@@ -344,14 +370,21 @@ def analyze(x, role="chitarra", bpm=None, say=lambda m: None):
         Pw = pw.mean(0)
         crest, flat, bright, dyn = drive_features(seg[sel], fr, pw)
         lvl = 10 * np.log10(np.mean(seg[sel] ** 2) + EPS)
-        wins.append(dict(t=s / SR, d=drive_score(crest, flat, dyn, role), crest=crest, flat=flat, bright=bright, dyn=dyn, lvl=lvl, P=Pw))
+        w = dict(t=s / SR, crest=crest, flat=flat, bright=bright, dyn=dyn, lvl=lvl, P=Pw)
+        if role == "basso":
+            ratio, spike, mean_r = bass_feats(seg)
+            w.update(d=bass_score(crest, ratio), ratio=ratio, spike=spike, bleed=bool(spike > 14 and mean_r - ratio > 5))
+        else:
+            w["d"] = drive_score(crest, flat, dyn, role)
+        wins.append(w)
     if not wins:
         raise ValueError("lo strumento suona a pezzi troppo corti per capirne il suono")
     Fw = np.array([[w["d"], w["bright"], w["lvl"]] for w in wins])
     lab = group_sounds(Fw)
 
     say("Cerco delay e riverbero")
-    dly, i1 = detect_delay(m, act_s, bpm)
+    # sul basso le note basse si ripetono identiche a ogni periodo e ingannano la ricerca dell'eco: il delay sul basso è rarissimo
+    dly, i1 = (None, {}) if role == "basso" else detect_delay(m, act_s, bpm)
     rev, i2 = detect_reverb(m)
     mod, i3 = None, {}
 
@@ -395,7 +428,15 @@ def analyze(x, role="chitarra", bpm=None, say=lambda m: None):
     if mod:
         fxc["chorus"] = {k: round(v, 2) for k, v in mod.items()}
     info = {"active": round(float(act.mean()), 2), **i1, **i2, **i3}
-    return {"sounds": sounds, "freqs": FREQS, "curve": [round(float(v), 1) for v in total], "effects": fxc, "info": info,
+    warn = ""
+    if role == "basso":
+        bl = float(np.mean([w.get("bleed", False) for w in wins]))
+        info.update(bleed=round(bl, 2), spike=round(float(np.median([w["spike"] for w in wins])), 1), ratio=round(float(np.median([w["ratio"] for w in wins])), 1))
+        if bl > 0.35:
+            warn = "bleed"
+    if warn:
+        info["warn"] = warn
+    return {"warn": warn, "sounds": sounds, "freqs": FREQS, "curve": [round(float(v), 1) for v in total], "effects": fxc, "info": info,
             "dur": round(len(m) / SR, 1)}
 
 
