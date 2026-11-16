@@ -7,6 +7,9 @@ llvmlite<0.44
 setuptools<70
 protobuf<5
 runpod>=1.6,<1.8
+# FastAPI (arriva con runpod): le versioni nuove portano librerie che vogliono protobuf 5, in conflitto con MediaPipe (protobuf 4)
+fastapi<0.111
+pydantic<2.10
 soundfile<0.14
 pillow<11
 huggingface_hub>=0.20,<0.27
