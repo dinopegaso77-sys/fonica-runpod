@@ -1,7 +1,10 @@
-# Fonica Infinity - Demucs + Whisper su RunPod Serverless (scheda video NVIDIA)
+# Pure Voltage - Demucs + Whisper su RunPod Serverless (scheda video NVIDIA)
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+# versioni bloccate per tutte le installazioni: una ricostruzione futura non può prendere librerie che non vanno d'accordo
+COPY vincoli.txt /vincoli.txt
+ENV PIP_CONSTRAINT=/vincoli.txt
 # ffmpeg per l'audio, compilatore per i pacchetti che non arrivano già pronti
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -35,4 +38,9 @@ RUN python -c "import mediapipe, cv2, PIL; from mediapipe.tasks.python import vi
 COPY video.py /video.py
 COPY tone.py /tone.py
 COPY handler.py /handler.py
+
+# controllo finale: se una libreria non si carica, la costruzione si ferma qui e RunPod non riceve un worker guasto
+RUN python -c "import numpy, scipy, torch, torchaudio, demucs, whisper, soundfile, runpod, speechbrain, cv2, mediapipe; print('controllo ok', 'numpy', numpy.__version__, 'torch', torch.__version__, 'runpod', runpod.__version__)" \
+    && python -m demucs --help > /dev/null \
+    && cd / && python -c "import ast; ast.parse(open('/handler.py').read()); import tone, video; print('worker ok')"
 CMD ["python", "-u", "/handler.py"]

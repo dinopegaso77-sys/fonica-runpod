@@ -1,0 +1,12 @@
+# Pure Voltage - versioni massime delle librerie del worker RunPod
+# (servono a non far cambiare le librerie da sole quando l'immagine si ricostruisce)
+numpy<2
+scipy<1.15
+numba<0.61
+llvmlite<0.44
+setuptools<70
+protobuf<5
+runpod>=1.6,<1.8
+soundfile<0.14
+pillow<11
+huggingface_hub>=0.20,<0.27

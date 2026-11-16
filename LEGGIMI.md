@@ -1,4 +1,4 @@
-# Fonica Infinity su RunPod
+# Pure Voltage su RunPod
 
 Il "worker" separa i brani con Demucs e trascrive il testo con Whisper, su una scheda video NVIDIA di RunPod.
 Ogni utente usa il **proprio** account e il **proprio** credito RunPod.
@@ -21,12 +21,12 @@ Gli utenti la ricevono automaticamente alla successiva accensione della scheda v
 
 ---
 
-## Per chi usa l'app (lo trovi anche dentro Fonica Infinity)
+## Per chi usa l'app (lo trovi anche dentro Pure Voltage)
 
 1. Crea un account su runpod.io (va bene anche l'accesso con Google).
 2. Ricarica un po' di credito (con 10 $ si separano molti brani).
 3. In RunPod: **Settings → API Keys → Create API Key**, permesso **Read/Write**, copia la chiave.
-4. In Fonica Infinity: **Libreria → Separa un brano → RunPod**, incolla la chiave e premi **Collega**.
+4. In Pure Voltage: **Libreria → Separa un brano → RunPod**, incolla la chiave e premi **Collega**.
    L'app crea da sola il servizio sul tuo account.
 
 La prima volta RunPod scarica il programma (10–20 minuti): il primo brano resta in coda finché è pronto.
@@ -42,3 +42,7 @@ La chiave resta solo nel tuo browser. Non condividerla con nessuno.
 - Video finale: la modalità `video` rifà il video registrato (sfondo, trucco, duetto, testo karaoke, logo) più veloce del tempo reale, usando tutti i processori della macchina in parallelo. Con `lipsync` controlla secondo per secondo che bocca e voce coincidano e corregge lo spostamento (fino a ±0,3 s). I file non passano dentro la richiesta: l'app li mette nel cloud R2 dell'utente e manda al worker solo indirizzi firmati che scadono dopo un'ora, quindi serve R2 collegato. Variabile `PV_PROCS` per limitare i processi.
 - Suono del brano: la modalità `tone` analizza la traccia separata di chitarra o basso (servono le 6 tracce per la chitarra) e restituisce i suoni del brano: quanto è distorto, le parti con suoni diversi, delay (tempo e ripetizioni), riverbero (durata e quantità), compressione e la curva delle frequenze per l'«EQ di somiglianza». Solo calcolo sul processore con numpy (file `tone.py`), circa 10-30 secondi a brano. Chorus, phaser e flanger non sono ancora riconosciuti. Anche qui la traccia passa dal cloud R2 con un indirizzo firmato.
 - Separazione «6 tracce affinate» (`model: "mix6"`): fa la separazione a 6 tracce e poi ripassa voce, basso e batteria con `htdemucs_ft`, più preciso (per esempio quando nel basso resta la cassa della batteria). Ci mette circa il doppio. Nel suono del basso la batteria rimasta viene riconosciuta e segnalata (`warn: "bleed"`).
+
+## Versioni delle librerie
+
+Il file `vincoli.txt` blocca le versioni massime delle librerie, così una ricostruzione dell'immagine non può prendere versioni che non vanno d'accordo. Alla fine del Dockerfile un controllo carica tutte le librerie: se qualcosa non va, la costruzione su GitHub (Actions) si ferma con la X rossa e RunPod continua a usare il worker precedente.
