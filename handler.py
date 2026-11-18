@@ -264,7 +264,64 @@ def gpu_name():
         return "sconosciuta (" + str(e)[:80] + ")"
 
 
-def transcribe(path, language=None, prompt=None):
+QWEN_PY = "/opt/qwen/bin/python"
+ASR_ENGINE = os.environ.get("ASR_ENGINE", "qwen")  # "whisper" per tornare sempre al vecchio modo
+
+
+def venv_run(script, payload, progress=None, env=None, timeout=1500):
+    """Lancia uno script nell'ambiente separato /opt/qwen; le righe «@@ ...» diventano avvisi per l'app."""
+    import json
+    import subprocess as sp
+    work = tempfile.mkdtemp()
+    try:
+        req, out = os.path.join(work, "req.json"), os.path.join(work, "out.json")
+        with open(req, "w") as fh:
+            json.dump(payload, fh)
+        pr = sp.Popen([QWEN_PY, "-u", script, req, out], stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+                      env=dict(os.environ, **(env or {})))
+        t0, tail = time.time(), []
+        for line in pr.stdout:
+            line = line.rstrip()
+            if line.startswith("@@ "):
+                if progress:
+                    progress(line[3:])
+            elif line:
+                tail = (tail + [line])[-40:]
+            if time.time() - t0 > timeout:
+                pr.kill()
+                raise RuntimeError("tempo scaduto")
+        pr.wait()
+        if pr.returncode != 0 or not os.path.exists(out):
+            raise RuntimeError("\n".join(tail)[-1500:] or "uscito con codice %s" % pr.returncode)
+        with open(out) as fh:
+            return json.load(fh)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def transcribe(path, language=None, prompt=None, progress=None, engine=None):
+    """Testo dalla voce: prima Qwen3-ASR (più preciso sul canto); se non va, Whisper come sempre."""
+    note = None
+    if (engine or ASR_ENGINE) == "qwen" and os.path.exists(QWEN_PY):
+        try:
+            res = venv_run("/testi.py", {"audio": path, "language": language or ""}, progress)
+            res["segments"] = [sg for sg in res.get("segments", []) if not HALLU.search(sg.get("text", ""))]
+            if res["segments"]:
+                return res
+            note = "Qwen3 non ha trovato parole"
+        except Exception as e:  # qualsiasi problema: si usa Whisper
+            note = "Qwen3 non disponibile: " + str(e)[-300:]
+        print(note, flush=True)
+        if progress:
+            progress("Trascrivo il testo con Whisper")
+    res = whisper_transcribe(path, language, prompt)
+    res["engine"] = "whisper-" + ASR_MODEL
+    if note:
+        res["note"] = note
+    return res
+
+
+def whisper_transcribe(path, language=None, prompt=None):
     import torch
     m = asr_model()
     res = m.transcribe(
@@ -364,6 +421,22 @@ def shift(job, inp):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def hfsync(job, inp):
+    """Una volta sola: copia i programmi nella cartella Hugging Face di Pure Voltage.
+    Richiesta: {"mode": "hfsync", "hf_token": "hf_...", "repo": "Purevoltage/pure-voltage-models"}"""
+    tok = (inp.get("hf_token") or "").strip()
+    if not tok.startswith("hf_"):
+        return {"error": "manca hf_token: la chiave Hugging Face con permesso Write (inizia con hf_)"}
+    t0 = time.time()
+    try:
+        res = venv_run("/copia.py", {"repo": inp.get("repo") or "", "force": bool(inp.get("force"))},
+                       lambda m: runpod.serverless.progress_update(job, m), env={"HF_TOKEN": tok}, timeout=3000)
+        res["seconds"] = round(time.time() - t0, 1)
+        return res
+    except Exception as e:
+        return {"error": str(e).replace(tok, "hf_***")[-700:]}
+
+
 def handler(job):
     inp = job.get("input") or {}
     if inp.get("mode") == "shift":
@@ -376,6 +449,9 @@ def handler(job):
         # video finale: i file passano dal cloud R2 dell'utente (indirizzi firmati), non dentro la richiesta
         from video import video_job
         return video_job(job, inp, lambda m: runpod.serverless.progress_update(job, m))
+    if inp.get("mode") == "hfsync":
+        return hfsync(job, inp)
+    prog = lambda m: runpod.serverless.progress_update(job, m)
     data = inp.get("audio_b64")
     if not data:
         return {"error": "manca il file audio"}
@@ -393,7 +469,7 @@ def handler(job):
         # --- solo trascrizione ---
         if inp.get("mode") == "transcribe":
             runpod.serverless.progress_update(job, "Trascrivo il testo dalla voce")
-            return {"lyrics": transcribe(src, lang, prompt), "seconds": round(time.time() - t0, 1)}
+            return {"lyrics": transcribe(src, lang, prompt, prog, inp.get("asr")), "seconds": round(time.time() - t0, 1)}
 
         # --- chi canta: riconosce le due voci dei duetti ---
         if inp.get("mode") == "voices":
@@ -476,7 +552,7 @@ def handler(job):
             if os.path.exists(voc):
                 runpod.serverless.progress_update(job, "Trascrivo il testo dalla voce")
                 try:
-                    lyrics = transcribe(voc, lang, prompt)
+                    lyrics = transcribe(voc, lang, prompt, prog, inp.get("asr"))
                 except Exception as e:  # la separazione resta valida anche se la trascrizione fallisce
                     lyrics = {"error": str(e)[-300:], "segments": []}
 

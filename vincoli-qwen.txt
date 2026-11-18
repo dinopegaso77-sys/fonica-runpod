@@ -1,0 +1,9 @@
+# Pure Voltage - versioni per l'ambiente separato /opt/qwen (testi con Qwen3-ASR)
+# torch e torchaudio restano quelli del sistema (2.3.1): qui non si reinstallano
+qwen-asr==0.0.6
+transformers==4.57.6
+huggingface_hub>=0.34,<1.0
+accelerate<1.13
+numpy<2
+torch==2.3.1
+torchaudio==2.3.1
