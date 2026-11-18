@@ -49,7 +49,8 @@ import time
 
 import runpod
 
-MODELS = {"htdemucs", "htdemucs_6s", "htdemucs_ft", "mix6"}  # mix6: 6 tracce, con voce, basso e batteria rifatti dal modello più preciso
+MODELS = {"htdemucs", "htdemucs_6s", "htdemucs_ft", "mix6", "roformer"}
+SEP_ENGINE = os.environ.get("SEP_ENGINE", "roformer")  # "demucs" per tornare sempre a Demucs  # mix6: 6 tracce, con voce, basso e batteria rifatti dal modello più preciso
 LIMIT = 18_500_000  # caratteri base64 in uscita: RunPod accetta circa 20 MB per risposta
 ASR_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
 
@@ -310,7 +311,7 @@ def transcribe(path, language=None, prompt=None, progress=None, engine=None):
                 return res
             note = "Qwen3 non ha trovato parole"
         except Exception as e:  # qualsiasi problema: si usa Whisper
-            note = "Qwen3 non disponibile: " + str(e)[-300:]
+            note = "Qwen3 non disponibile: " + (str(e).strip().splitlines() or [""])[-1][-200:]
         print(note, flush=True)
         if progress:
             progress("Trascrivo il testo con Whisper")
@@ -514,13 +515,30 @@ def handler(job):
         print("Scheda video:", gpu, "- modello:", model, flush=True)
         runpod.serverless.progress_update(job, "Separo le tracce sulla scheda video")
         out = os.path.join(work, "out")
-        hybrid = model == "mix6"
-        mdir = "htdemucs_6s" if hybrid else model
-        base = ["python", "-m", "demucs", "-n", mdir, "-o", out, "--filename", "{stem}.{ext}"]
         note = None
         dev = "cuda" if gpu != "nessuna" else "cpu"
+        done = False
+        # 6 tracce: prima il separatore nuovo BS-RoFormer SW (chitarra e basso molto più puliti);
+        # se non va, Demucs come sempre
+        if model in ("htdemucs_6s", "mix6", "roformer") and dev == "cuda" and os.path.exists(QWEN_PY) \
+                and (inp.get("sep") or SEP_ENGINE) == "roformer":
+            try:
+                venv_run("/separa.py", {"audio": src, "out": os.path.join(out, "roformer")}, prog, timeout=1500)
+                mdir, model, done = "roformer", "bs_roformer_sw", True
+            except Exception as e:
+                note = "separatore nuovo non disponibile, usato Demucs: " + (str(e).strip().splitlines() or [""])[-1][-200:]
+                print(note, flush=True)
+                shutil.rmtree(os.path.join(out, "roformer"), ignore_errors=True)
+                runpod.serverless.progress_update(job, "Separo le tracce con Demucs")
+        if model == "roformer":
+            model = "mix6"
+        hybrid = model == "mix6" and not done
+        if not done:
+            mdir = "htdemucs_6s" if hybrid else model
+        base = ["python", "-m", "demucs", "-n", mdir, "-o", out, "--filename", "{stem}.{ext}"]
         try:
-            run(base + ["-d", dev, src])
+            if not done:
+                run(base + ["-d", dev, src])
         except RuntimeError as e:
             # se la scheda video dà problemi, riprova sul processore: più lento ma funziona
             note = "scheda video %s non utilizzabile (%s): separato sul processore" % (gpu, str(e)[-200:])

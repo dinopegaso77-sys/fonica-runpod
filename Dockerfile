@@ -26,6 +26,10 @@ COPY vincoli-qwen.txt /vincoli-qwen.txt
 RUN apt-get update && apt-get install -y --no-install-recommends sox && rm -rf /var/lib/apt/lists/*
 RUN python -m venv --system-site-packages /opt/qwen \
     && PIP_CONSTRAINT=/vincoli-qwen.txt /opt/qwen/bin/pip install --no-cache-dir "qwen-asr==0.0.6" hf_xet
+# separatore nuovo BS-RoFormer SW (6 tracce) nello stesso ambiente. Se non si installa, la costruzione continua:
+# il worker userà Demucs come sempre (lo dice il controllo finale qui sotto)
+RUN PIP_CONSTRAINT=/vincoli-qwen.txt /opt/qwen/bin/pip install --no-cache-dir "bs-roformer-infer==0.1.5" \
+    || echo "ATTENZIONE: separatore nuovo non installato, resta Demucs"
 
 # scarica i modelli dentro l'immagine, così ogni avvio è più rapido
 RUN python -c "from demucs.pretrained import get_model; [get_model(n) for n in ('htdemucs','htdemucs_6s','htdemucs_ft')]"
@@ -47,6 +51,7 @@ COPY video.py /video.py
 COPY tone.py /tone.py
 COPY testi.py /testi.py
 COPY copia.py /copia.py
+COPY separa.py /separa.py
 COPY handler.py /handler.py
 
 # controllo finale: se una libreria non si carica, la costruzione si ferma qui e RunPod non riceve un worker guasto
@@ -54,5 +59,6 @@ RUN python -c "import numpy, scipy, torch, torchaudio, demucs, whisper, soundfil
     && python -m demucs --help > /dev/null \
     && /opt/qwen/bin/python -c "import torch, transformers, huggingface_hub, qwen_asr; from qwen_asr import Qwen3ASRModel; print('qwen ok', 'torch', torch.__version__, 'transformers', transformers.__version__, 'hub', huggingface_hub.__version__)" \
     && python -c "import huggingface_hub, speechbrain; print('sistema ok', 'hub', huggingface_hub.__version__)" \
-    && cd / && python -c "import ast; [ast.parse(open(f).read()) for f in ('/handler.py', '/testi.py', '/copia.py')]; import tone, video; print('worker ok')"
+    && (/opt/qwen/bin/python -c "import bs_roformer; print('separatore nuovo ok')" && /opt/qwen/bin/bs-roformer-infer --help | head -40 || echo "separatore nuovo assente: si usa Demucs") \
+    && cd / && python -c "import ast; [ast.parse(open(f).read()) for f in ('/handler.py', '/testi.py', '/copia.py', '/separa.py')]; import tone, video; print('worker ok')"
 CMD ["python", "-u", "/handler.py"]

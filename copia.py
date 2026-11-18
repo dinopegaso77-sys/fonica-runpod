@@ -17,10 +17,11 @@ import tempfile
 SOURCES = {
     "qwen3-asr-1.7b": "Qwen/Qwen3-ASR-1.7B",
     "qwen3-forcedaligner-0.6b": "Qwen/Qwen3-ForcedAligner-0.6B",
+    "bs-roformer-sw": "enerjazzer/BS-ROFO-SW-Fixed",
 }
 
 README = """---
-license: apache-2.0
+license: other
 tags:
 - audio
 - automatic-speech-recognition
@@ -33,8 +34,9 @@ Copia dei modelli usati dal worker RunPod di Pure Voltage, senza modifiche.
 |---|---|---|
 | `qwen3-asr-1.7b` | [Qwen/Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) | Apache 2.0 |
 | `qwen3-forcedaligner-0.6b` | [Qwen/Qwen3-ForcedAligner-0.6B](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B) | Apache 2.0 |
+| `bs-roformer-sw` | BS-RoFormer SW di jarredou ([copia di enerjazzer](https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed)) | CC BY-NC-SA 4.0 (non commerciale) |
 
-Tutti i diritti restano agli autori originali (Qwen Team, Alibaba Cloud).
+Tutti i diritti restano agli autori originali (Qwen Team, Alibaba Cloud; jarredou).
 """
 
 
@@ -55,7 +57,7 @@ def main(req_path, out_path):
     have = set(api.list_repo_files(repo))
     done, skipped = [], []
     for sub, src in SOURCES.items():
-        if not req.get("force") and (sub + "/config.json") in have:
+        if not req.get("force") and any(f.startswith(sub + "/") for f in have):
             skipped.append(sub)
             continue
         tmp = tempfile.mkdtemp(dir="/tmp")
