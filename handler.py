@@ -422,6 +422,55 @@ def shift(job, inp):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def rhythm(mix, drums, progress=None):
+    """Battiti (Beat This!) e batteria (ADTOF) sulla scheda video; se non va, l'app usa il suo metodo."""
+    if not os.path.exists(QWEN_PY):
+        return {"error": "ritmo nuovo non installato"}
+    try:
+        return venv_run("/ritmo.py", {"mix": mix, "drums": drums, "device": "cuda" if gpu_name() != "nessuna" else "cpu"},
+                        progress, timeout=600)
+    except Exception as e:
+        msg = (str(e).strip().splitlines() or [""])[-1][-300:]
+        print("ritmo non riuscito:", str(e)[-1500:], flush=True)
+        return {"error": msg}
+
+
+def rhythm_job(job, inp):
+    """Brani già in libreria: l'app manda la batteria (e se c'è il basso), il worker rifà ritmo e batteria."""
+    t0 = time.time()
+    work = tempfile.mkdtemp()
+    try:
+        files = inp.get("files") or []
+        if not files:
+            return {"error": "manca la traccia della batteria"}
+        runpod.serverless.progress_update(job, "Preparo le tracce")
+        wavs, drums = [], None
+        for f in files:
+            k = re.sub(r"[^a-z0-9_]", "", os.path.splitext(os.path.basename(f.get("name") or "x"))[0].lower()) or "x"
+            ext = os.path.splitext(f.get("name") or "")[1].lower() or ".m4a"
+            p = os.path.join(work, k + ext)
+            with open(p, "wb") as fh:
+                fh.write(base64.b64decode(f.get("b64") or ""))
+            w = os.path.join(work, k + ".wav")
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", p, "-ac", "1", "-ar", "44100", w])
+            wavs.append(w)
+            if k == "drums":
+                drums = w
+        mix = os.path.join(work, "mix.wav")
+        if len(wavs) > 1:
+            ins = sum((["-i", w] for w in wavs), [])
+            run(["ffmpeg", "-y", "-loglevel", "error"] + ins + ["-filter_complex", "amix=inputs=%d:normalize=0" % len(wavs), mix])
+        else:
+            shutil.copyfile(wavs[0], mix)
+        r = rhythm(mix, drums, lambda m: runpod.serverless.progress_update(job, m))
+        return {"rhythm": r, "gpu": gpu_name(), "seconds": round(time.time() - t0, 1)}
+    except Exception as e:
+        print("ERRORE ritmo:", repr(e)[-2000:], flush=True)
+        return {"error": str(e)[-700:]}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def hfsync(job, inp):
     """Una volta sola: copia i programmi nella cartella Hugging Face di Pure Voltage.
     Richiesta: {"mode": "hfsync", "hf_token": "hf_...", "repo": "Purevoltage/pure-voltage-models"}"""
@@ -452,6 +501,8 @@ def handler(job):
         return video_job(job, inp, lambda m: runpod.serverless.progress_update(job, m))
     if inp.get("mode") == "hfsync":
         return hfsync(job, inp)
+    if inp.get("mode") == "ritmo":
+        return rhythm_job(job, inp)
     prog = lambda m: runpod.serverless.progress_update(job, m)
     data = inp.get("audio_b64")
     if not data:
@@ -585,6 +636,18 @@ def handler(job):
                     print("voci non riconosciute:", repr(e)[-500:], flush=True)
                     sing = {"error": str(e)[-300:]}
 
+        # ritmo e batteria più precisi (Beat This! e ADTOF): se non riescono, la separazione resta valida
+        rhy = None
+        if inp.get("rhythm"):
+            runpod.serverless.progress_update(job, "Trovo battiti e batteria")
+            try:
+                mixw = os.path.join(work, "mix_ritmo.wav")
+                run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", "44100", mixw])
+                dr = os.path.join(out, mdir, "drums.wav")
+                rhy = rhythm(mixw, dr if os.path.exists(dr) else None, prog)
+            except Exception as e:
+                rhy = {"error": str(e)[-300:]}
+
         # tracce praticamente mute (per esempio il piano in un brano senza piano): non si inviano
         def silent(path):
             try:
@@ -626,7 +689,7 @@ def handler(job):
             return {"error": "brano troppo lungo per una sola richiesta (oltre 10 minuti circa): prova un file più corto"}
         br = max(brs.values())
         return {"stems": res, "format": "m4a", "bitrate": br, "model": model, "gpu": gpu, "note": note,
-                "lyrics": lyrics, "singers": sing, "seconds": round(time.time() - t0, 1)}
+                "lyrics": lyrics, "singers": sing, "rhythm": rhy, "seconds": round(time.time() - t0, 1)}
     except Exception as e:  # il messaggio torna all'app
         print("ERRORE:", repr(e)[-3000:], flush=True)
         return {"error": str(e)[-700:]}
