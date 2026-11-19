@@ -29,6 +29,10 @@ Due modi d'uso:
    Anche la separazione accetta "voices": true e allora risponde anche con "singers".
 
 5) Tonalità pronte: sposta di semitoni le tracce già separate (nessuna nuova separazione)
+   {"input": {"mode": "cloudfix", "get": {"vocals": "<url firmato>", ...}, "put": {"vocals": "<url firmato>", ...},
+              "del": {...}, "info_put": "<url firmato di pv-fix.json>", "todo": {"sep": true, "asr": true, "rhy": true}}}
+   -> RunPod sistema da solo un brano del cloud: rifà separazione, testo ascoltato e ritmo,
+      carica le tracce nuove e scrive pv-fix.json nella cartella del brano. L'app lo legge alla prossima apertura.
    {"input": {"mode": "tone", "audio_url": "<traccia della chitarra o del basso, indirizzo firmato R2>", "role": "chitarra", "bpm": 130}}
    → suoni del brano (distorsione, delay, riverbero, curva delle frequenze) pronti per la pedaliera
 
@@ -40,6 +44,7 @@ In caso di problemi: {"error": "messaggio"}
 """
 import base64
 import glob
+import json
 import os
 import re
 import shutil
@@ -471,6 +476,99 @@ def rhythm_job(job, inp):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _http(url, data=None, method="GET", ctype=None, timeout=600):
+    import urllib.request
+    req = urllib.request.Request(url, data=data, method=method)
+    if ctype:
+        req.add_header("Content-Type", ctype)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def cloudfix(job, inp):
+    """Sistema un brano del cloud senza che l'app resti aperta: tutto passa da indirizzi firmati R2."""
+    t0 = time.time()
+    work = tempfile.mkdtemp()
+    say = lambda m: runpod.serverless.progress_update(job, m)
+    todo = inp.get("todo") or {}
+    lang = (inp.get("language") or "").strip()
+    res = {"v": 1, "done": {}, "notes": []}
+    try:
+        say("Scarico le tracce dal cloud")
+        files = {}
+        for k, url in (inp.get("get") or {}).items():
+            ext = os.path.splitext(url.split("?")[0])[1].lower() or ".mp3"
+            p = os.path.join(work, re.sub(r"[^a-z0-9_]", "", k.lower()) + ext)
+            with open(p, "wb") as fh:
+                fh.write(_http(url))
+            files[k] = p
+        if not files:
+            return {"error": "nessuna traccia da scaricare"}
+        mix = os.path.join(work, "mix.mp3")
+        if len(files) > 1:
+            ins = sum((["-i", f] for f in files.values()), [])
+            run(["ffmpeg", "-y", "-loglevel", "error"] + ins + ["-filter_complex", "amix=inputs=%d:normalize=0" % len(files),
+                 "-ac", "2", "-b:a", "192k", mix])
+        else:
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", list(files.values())[0], "-ac", "2", "-b:a", "192k", mix])
+
+        if todo.get("sep"):
+            with open(mix, "rb") as fh:
+                b64 = base64.b64encode(fh.read()).decode()
+            out = handler({"id": job.get("id"), "input": {"audio_b64": b64, "filename": "mix.mp3",
+                           "model": inp.get("model") or "htdemucs_6s", "bitrate": 128, "voices": True, "rhythm": True,
+                           "transcribe": bool(todo.get("asr", True)), "language": lang}})
+            if not out or out.get("error"):
+                return {"error": "separazione: " + str((out or {}).get("error"))[-400:]}
+            say("Carico le tracce nuove nel cloud")
+            put, dele, up = inp.get("put") or {}, inp.get("del") or {}, []
+            for k, b in (out.get("stems") or {}).items():
+                if k in put:
+                    _http(put[k], base64.b64decode(b), "PUT", "audio/mp4")
+                    up.append(k)
+            for k in up:
+                if dele.get(k):
+                    try:
+                        _http(dele[k], None, "DELETE")
+                    except Exception as e:
+                        res["notes"].append("non ho tolto la vecchia traccia " + k)
+            res.update({"model": out.get("model"), "stems": up, "lyrics": out.get("lyrics"), "singers": out.get("singers"),
+                        "rhythm": out.get("rhythm")})
+            res["done"] = {"sep": True, "asr": bool(out.get("lyrics")), "rhy": bool(out.get("rhythm") and not (out.get("rhythm") or {}).get("error"))}
+        else:
+            if todo.get("asr"):
+                v = files.get("vocals")
+                if v:
+                    w = os.path.join(work, "vocals16.wav")
+                    run(["ffmpeg", "-y", "-loglevel", "error", "-i", v, "-ac", "1", "-ar", "16000", w])
+                    say("Trascrivo il testo dalla voce")
+                    res["lyrics"] = transcribe(w, lang or None, None, say, inp.get("asr"))
+                    res["done"]["asr"] = True
+                else:
+                    res["notes"].append("manca la traccia della voce")
+            if todo.get("rhy"):
+                mw = os.path.join(work, "mix_ritmo.wav")
+                run(["ffmpeg", "-y", "-loglevel", "error", "-i", mix, "-ac", "1", "-ar", "44100", mw])
+                dr = None
+                if files.get("drums"):
+                    dr = os.path.join(work, "drums_ritmo.wav")
+                    run(["ffmpeg", "-y", "-loglevel", "error", "-i", files["drums"], "-ac", "1", "-ar", "44100", dr])
+                r = rhythm(mw, dr, say)
+                res["rhythm"] = r
+                res["done"]["rhy"] = not (r or {}).get("error")
+        res["t"] = int(time.time())
+        res["seconds"] = round(time.time() - t0, 1)
+        if inp.get("info_put"):
+            say("Scrivo il risultato nel cloud")
+            _http(inp["info_put"], json.dumps(res).encode("utf-8"), "PUT", "application/json")
+        return {"ok": True, "done": res["done"], "seconds": res["seconds"], "notes": res["notes"]}
+    except Exception as e:
+        print("ERRORE cloudfix:", repr(e)[-2000:], flush=True)
+        return {"error": str(e)[-700:]}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def hfsync(job, inp):
     """Una volta sola: copia i programmi nella cartella Hugging Face di Pure Voltage.
     Richiesta: {"mode": "hfsync", "hf_token": "hf_...", "repo": "Purevoltage/pure-voltage-models"}"""
@@ -503,6 +601,8 @@ def handler(job):
         return hfsync(job, inp)
     if inp.get("mode") == "ritmo":
         return rhythm_job(job, inp)
+    if inp.get("mode") == "cloudfix":
+        return cloudfix(job, inp)
     prog = lambda m: runpod.serverless.progress_update(job, m)
     data = inp.get("audio_b64")
     if not data:
