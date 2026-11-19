@@ -29,10 +29,6 @@ Due modi d'uso:
    Anche la separazione accetta "voices": true e allora risponde anche con "singers".
 
 5) Tonalità pronte: sposta di semitoni le tracce già separate (nessuna nuova separazione)
-   {"input": {"mode": "cloudfix", "get": {"vocals": "<url firmato>", ...}, "put": {"vocals": "<url firmato>", ...},
-              "del": {...}, "info_put": "<url firmato di pv-fix.json>", "todo": {"sep": true, "asr": true, "rhy": true}}}
-   -> RunPod sistema da solo un brano del cloud: rifà separazione, testo ascoltato e ritmo,
-      carica le tracce nuove e scrive pv-fix.json nella cartella del brano. L'app lo legge alla prossima apertura.
    {"input": {"mode": "tone", "audio_url": "<traccia della chitarra o del basso, indirizzo firmato R2>", "role": "chitarra", "bpm": 130}}
    → suoni del brano (distorsione, delay, riverbero, curva delle frequenze) pronti per la pedaliera
 
@@ -44,7 +40,6 @@ In caso di problemi: {"error": "messaggio"}
 """
 import base64
 import glob
-import json
 import os
 import re
 import shutil
@@ -271,11 +266,10 @@ def gpu_name():
 
 
 QWEN_PY = "/opt/qwen/bin/python"
-RITMO_PY = "/opt/ritmo/bin/python"  # Beat This! e ADTOF, in un ambiente separato da Qwen3
 ASR_ENGINE = os.environ.get("ASR_ENGINE", "qwen")  # "whisper" per tornare sempre al vecchio modo
 
 
-def venv_run(script, payload, progress=None, env=None, timeout=1500, py=None):
+def venv_run(script, payload, progress=None, env=None, timeout=1500):
     """Lancia uno script nell'ambiente separato /opt/qwen; le righe «@@ ...» diventano avvisi per l'app."""
     import json
     import subprocess as sp
@@ -284,7 +278,7 @@ def venv_run(script, payload, progress=None, env=None, timeout=1500, py=None):
         req, out = os.path.join(work, "req.json"), os.path.join(work, "out.json")
         with open(req, "w") as fh:
             json.dump(payload, fh)
-        pr = sp.Popen([py or QWEN_PY, "-u", script, req, out], stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+        pr = sp.Popen([QWEN_PY, "-u", script, req, out], stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
                       env=dict(os.environ, **(env or {})))
         t0, tail = time.time(), []
         for line in pr.stdout:
@@ -428,148 +422,6 @@ def shift(job, inp):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def rhythm(mix, drums, progress=None):
-    """Battiti (Beat This!) e batteria (ADTOF) sulla scheda video; se non va, l'app usa il suo metodo."""
-    if not os.path.exists(RITMO_PY):
-        return {"error": "ritmo nuovo non installato"}
-    try:
-        return venv_run("/ritmo.py", {"mix": mix, "drums": drums, "device": "cuda" if gpu_name() != "nessuna" else "cpu"},
-                        progress, timeout=600, py=RITMO_PY)
-    except Exception as e:
-        msg = (str(e).strip().splitlines() or [""])[-1][-300:]
-        print("ritmo non riuscito:", str(e)[-1500:], flush=True)
-        return {"error": msg}
-
-
-def rhythm_job(job, inp):
-    """Brani già in libreria: l'app manda la batteria (e se c'è il basso), il worker rifà ritmo e batteria."""
-    t0 = time.time()
-    work = tempfile.mkdtemp()
-    try:
-        files = inp.get("files") or []
-        if not files:
-            return {"error": "manca la traccia della batteria"}
-        runpod.serverless.progress_update(job, "Preparo le tracce")
-        wavs, drums = [], None
-        for f in files:
-            k = re.sub(r"[^a-z0-9_]", "", os.path.splitext(os.path.basename(f.get("name") or "x"))[0].lower()) or "x"
-            ext = os.path.splitext(f.get("name") or "")[1].lower() or ".m4a"
-            p = os.path.join(work, k + ext)
-            with open(p, "wb") as fh:
-                fh.write(base64.b64decode(f.get("b64") or ""))
-            w = os.path.join(work, k + ".wav")
-            run(["ffmpeg", "-y", "-loglevel", "error", "-i", p, "-ac", "1", "-ar", "44100", w])
-            wavs.append(w)
-            if k == "drums":
-                drums = w
-        mix = os.path.join(work, "mix.wav")
-        if len(wavs) > 1:
-            ins = sum((["-i", w] for w in wavs), [])
-            run(["ffmpeg", "-y", "-loglevel", "error"] + ins + ["-filter_complex", "amix=inputs=%d:normalize=0" % len(wavs), mix])
-        else:
-            shutil.copyfile(wavs[0], mix)
-        r = rhythm(mix, drums, lambda m: runpod.serverless.progress_update(job, m))
-        return {"rhythm": r, "gpu": gpu_name(), "seconds": round(time.time() - t0, 1)}
-    except Exception as e:
-        print("ERRORE ritmo:", repr(e)[-2000:], flush=True)
-        return {"error": str(e)[-700:]}
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def _http(url, data=None, method="GET", ctype=None, timeout=600):
-    import urllib.request
-    req = urllib.request.Request(url, data=data, method=method)
-    if ctype:
-        req.add_header("Content-Type", ctype)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
-
-
-def cloudfix(job, inp):
-    """Sistema un brano del cloud senza che l'app resti aperta: tutto passa da indirizzi firmati R2."""
-    t0 = time.time()
-    work = tempfile.mkdtemp()
-    say = lambda m: runpod.serverless.progress_update(job, m)
-    todo = inp.get("todo") or {}
-    lang = (inp.get("language") or "").strip()
-    res = {"v": 1, "done": {}, "notes": []}
-    try:
-        say("Scarico le tracce dal cloud")
-        files = {}
-        for k, url in (inp.get("get") or {}).items():
-            ext = os.path.splitext(url.split("?")[0])[1].lower() or ".mp3"
-            p = os.path.join(work, re.sub(r"[^a-z0-9_]", "", k.lower()) + ext)
-            with open(p, "wb") as fh:
-                fh.write(_http(url))
-            files[k] = p
-        if not files:
-            return {"error": "nessuna traccia da scaricare"}
-        mix = os.path.join(work, "mix.mp3")
-        if len(files) > 1:
-            ins = sum((["-i", f] for f in files.values()), [])
-            run(["ffmpeg", "-y", "-loglevel", "error"] + ins + ["-filter_complex", "amix=inputs=%d:normalize=0" % len(files),
-                 "-ac", "2", "-b:a", "192k", mix])
-        else:
-            run(["ffmpeg", "-y", "-loglevel", "error", "-i", list(files.values())[0], "-ac", "2", "-b:a", "192k", mix])
-
-        if todo.get("sep"):
-            with open(mix, "rb") as fh:
-                b64 = base64.b64encode(fh.read()).decode()
-            out = handler({"id": job.get("id"), "input": {"audio_b64": b64, "filename": "mix.mp3",
-                           "model": inp.get("model") or "htdemucs_6s", "bitrate": 128, "voices": True, "rhythm": True,
-                           "transcribe": bool(todo.get("asr", True)), "asr": inp.get("asr"), "language": lang}})
-            if not out or out.get("error"):
-                return {"error": "separazione: " + str((out or {}).get("error"))[-400:]}
-            say("Carico le tracce nuove nel cloud")
-            put, dele, up = inp.get("put") or {}, inp.get("del") or {}, []
-            for k, b in (out.get("stems") or {}).items():
-                if k in put:
-                    _http(put[k], base64.b64decode(b), "PUT", "audio/mp4")
-                    up.append(k)
-            for k in up:
-                if dele.get(k):
-                    try:
-                        _http(dele[k], None, "DELETE")
-                    except Exception as e:
-                        res["notes"].append("non ho tolto la vecchia traccia " + k)
-            res.update({"model": out.get("model"), "stems": up, "lyrics": out.get("lyrics"), "singers": out.get("singers"),
-                        "rhythm": out.get("rhythm")})
-            res["done"] = {"sep": True, "asr": bool(out.get("lyrics")), "rhy": bool(out.get("rhythm") and not (out.get("rhythm") or {}).get("error"))}
-        else:
-            if todo.get("asr"):
-                v = files.get("vocals")
-                if v:
-                    w = os.path.join(work, "vocals16.wav")
-                    run(["ffmpeg", "-y", "-loglevel", "error", "-i", v, "-ac", "1", "-ar", "16000", w])
-                    say("Trascrivo il testo dalla voce")
-                    res["lyrics"] = transcribe(w, lang or None, None, say, inp.get("asr"))
-                    res["done"]["asr"] = True
-                else:
-                    res["notes"].append("manca la traccia della voce")
-            if todo.get("rhy"):
-                mw = os.path.join(work, "mix_ritmo.wav")
-                run(["ffmpeg", "-y", "-loglevel", "error", "-i", mix, "-ac", "1", "-ar", "44100", mw])
-                dr = None
-                if files.get("drums"):
-                    dr = os.path.join(work, "drums_ritmo.wav")
-                    run(["ffmpeg", "-y", "-loglevel", "error", "-i", files["drums"], "-ac", "1", "-ar", "44100", dr])
-                r = rhythm(mw, dr, say)
-                res["rhythm"] = r
-                res["done"]["rhy"] = not (r or {}).get("error")
-        res["t"] = int(time.time())
-        res["seconds"] = round(time.time() - t0, 1)
-        if inp.get("info_put"):
-            say("Scrivo il risultato nel cloud")
-            _http(inp["info_put"], json.dumps(res).encode("utf-8"), "PUT", "application/json")
-        return {"ok": True, "done": res["done"], "seconds": res["seconds"], "notes": res["notes"]}
-    except Exception as e:
-        print("ERRORE cloudfix:", repr(e)[-2000:], flush=True)
-        return {"error": str(e)[-700:]}
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
 def hfsync(job, inp):
     """Una volta sola: copia i programmi nella cartella Hugging Face di Pure Voltage.
     Richiesta: {"mode": "hfsync", "hf_token": "hf_...", "repo": "Purevoltage/pure-voltage-models"}"""
@@ -600,10 +452,6 @@ def handler(job):
         return video_job(job, inp, lambda m: runpod.serverless.progress_update(job, m))
     if inp.get("mode") == "hfsync":
         return hfsync(job, inp)
-    if inp.get("mode") == "ritmo":
-        return rhythm_job(job, inp)
-    if inp.get("mode") == "cloudfix":
-        return cloudfix(job, inp)
     prog = lambda m: runpod.serverless.progress_update(job, m)
     data = inp.get("audio_b64")
     if not data:
@@ -737,18 +585,6 @@ def handler(job):
                     print("voci non riconosciute:", repr(e)[-500:], flush=True)
                     sing = {"error": str(e)[-300:]}
 
-        # ritmo e batteria più precisi (Beat This! e ADTOF): se non riescono, la separazione resta valida
-        rhy = None
-        if inp.get("rhythm"):
-            runpod.serverless.progress_update(job, "Trovo battiti e batteria")
-            try:
-                mixw = os.path.join(work, "mix_ritmo.wav")
-                run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", "44100", mixw])
-                dr = os.path.join(out, mdir, "drums.wav")
-                rhy = rhythm(mixw, dr if os.path.exists(dr) else None, prog)
-            except Exception as e:
-                rhy = {"error": str(e)[-300:]}
-
         # tracce praticamente mute (per esempio il piano in un brano senza piano): non si inviano
         def silent(path):
             try:
@@ -790,7 +626,7 @@ def handler(job):
             return {"error": "brano troppo lungo per una sola richiesta (oltre 10 minuti circa): prova un file più corto"}
         br = max(brs.values())
         return {"stems": res, "format": "m4a", "bitrate": br, "model": model, "gpu": gpu, "note": note,
-                "lyrics": lyrics, "singers": sing, "rhythm": rhy, "seconds": round(time.time() - t0, 1)}
+                "lyrics": lyrics, "singers": sing, "seconds": round(time.time() - t0, 1)}
     except Exception as e:  # il messaggio torna all'app
         print("ERRORE:", repr(e)[-3000:], flush=True)
         return {"error": str(e)[-700:]}
