@@ -31,14 +31,16 @@ RUN python -m venv --system-site-packages /opt/qwen \
 RUN PIP_CONSTRAINT=/vincoli-qwen.txt /opt/qwen/bin/pip install --no-cache-dir "bs-roformer-infer==0.1.5" \
     || echo "ATTENZIONE: separatore nuovo non installato, resta Demucs"
 
-# ritmo e batteria più precisi nello stesso ambiente: Beat This! (battiti e battute, MIT) e ADTOF (batteria, CC BY-NC-SA).
+# ritmo e batteria più precisi: Beat This! (battiti e battute, MIT) e ADTOF (batteria, CC BY-NC-SA).
+# Stanno in un ambiente TUTTO LORO (/opt/ritmo): così non possono mai cambiare le librerie di Qwen3 (testi) né del sistema.
 # Se non si installano, la costruzione continua: l'app usa il metodo che ha già sul dispositivo.
-RUN PIP_CONSTRAINT=/vincoli-qwen.txt /opt/qwen/bin/pip install --no-cache-dir tqdm einops soxr rotary-embedding-torch \
-    "https://github.com/CPJKU/beat_this/archive/main.zip" \
-    && /opt/qwen/bin/python -c "from beat_this.inference import File2Beats; File2Beats(checkpoint_path='final0', device='cpu', dbn=False); print('beat this ok')" \
+RUN python -m venv --system-site-packages /opt/ritmo \
+    && PIP_CONSTRAINT=/vincoli.txt /opt/ritmo/bin/pip install --no-cache-dir -c /vincoli-qwen.txt tqdm einops soxr rotary-embedding-torch \
+       "https://github.com/CPJKU/beat_this/archive/main.zip" \
+    && /opt/ritmo/bin/python -c "from beat_this.inference import File2Beats; File2Beats(checkpoint_path='final0', device='cpu', dbn=False); print('beat this ok')" \
     || echo "ATTENZIONE: Beat This! non installato, l'app calcola i battiti da sola"
-RUN PIP_CONSTRAINT=/vincoli-qwen.txt /opt/qwen/bin/pip install --no-cache-dir pretty_midi "git+https://github.com/xavriley/ADTOF-pytorch" \
-    && /opt/qwen/bin/python -c "import adtof_pytorch; print('adtof ok')" \
+RUN PIP_CONSTRAINT=/vincoli.txt /opt/ritmo/bin/pip install --no-cache-dir -c /vincoli-qwen.txt pretty_midi "git+https://github.com/xavriley/ADTOF-pytorch" \
+    && /opt/ritmo/bin/python -c "import adtof_pytorch; print('adtof ok')" \
     || echo "ATTENZIONE: ADTOF non installato, l'app scrive la batteria da sola"
 
 # scarica i modelli dentro l'immagine, così ogni avvio è più rapido
@@ -70,7 +72,7 @@ RUN python -c "import numpy, scipy, torch, torchaudio, demucs, whisper, soundfil
     && python -m demucs --help > /dev/null \
     && /opt/qwen/bin/python -c "import torch, transformers, huggingface_hub, qwen_asr; from qwen_asr import Qwen3ASRModel; print('qwen ok', 'torch', torch.__version__, 'transformers', transformers.__version__, 'hub', huggingface_hub.__version__)" \
     && python -c "import huggingface_hub, speechbrain; print('sistema ok', 'hub', huggingface_hub.__version__)" \
-    && (/opt/qwen/bin/python -c "import beat_this, adtof_pytorch; print('ritmo nuovo ok')" || echo "ritmo nuovo assente: l'app usa il suo metodo") \
+    && (/opt/ritmo/bin/python -c "import beat_this, adtof_pytorch; print('ritmo nuovo ok')" || echo "ritmo nuovo assente: l'app usa il suo metodo") \
     && (/opt/qwen/bin/python -c "import bs_roformer; print('separatore nuovo ok')" && /opt/qwen/bin/bs-roformer-infer --help | head -40 || echo "separatore nuovo assente: si usa Demucs") \
     && cd / && python -c "import ast; [ast.parse(open(f).read()) for f in ('/handler.py', '/testi.py', '/copia.py', '/separa.py', '/ritmo.py')]; import tone, video; print('worker ok')"
 CMD ["python", "-u", "/handler.py"]

@@ -271,10 +271,11 @@ def gpu_name():
 
 
 QWEN_PY = "/opt/qwen/bin/python"
+RITMO_PY = "/opt/ritmo/bin/python"  # Beat This! e ADTOF, in un ambiente separato da Qwen3
 ASR_ENGINE = os.environ.get("ASR_ENGINE", "qwen")  # "whisper" per tornare sempre al vecchio modo
 
 
-def venv_run(script, payload, progress=None, env=None, timeout=1500):
+def venv_run(script, payload, progress=None, env=None, timeout=1500, py=None):
     """Lancia uno script nell'ambiente separato /opt/qwen; le righe «@@ ...» diventano avvisi per l'app."""
     import json
     import subprocess as sp
@@ -283,7 +284,7 @@ def venv_run(script, payload, progress=None, env=None, timeout=1500):
         req, out = os.path.join(work, "req.json"), os.path.join(work, "out.json")
         with open(req, "w") as fh:
             json.dump(payload, fh)
-        pr = sp.Popen([QWEN_PY, "-u", script, req, out], stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+        pr = sp.Popen([py or QWEN_PY, "-u", script, req, out], stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
                       env=dict(os.environ, **(env or {})))
         t0, tail = time.time(), []
         for line in pr.stdout:
@@ -429,11 +430,11 @@ def shift(job, inp):
 
 def rhythm(mix, drums, progress=None):
     """Battiti (Beat This!) e batteria (ADTOF) sulla scheda video; se non va, l'app usa il suo metodo."""
-    if not os.path.exists(QWEN_PY):
+    if not os.path.exists(RITMO_PY):
         return {"error": "ritmo nuovo non installato"}
     try:
         return venv_run("/ritmo.py", {"mix": mix, "drums": drums, "device": "cuda" if gpu_name() != "nessuna" else "cpu"},
-                        progress, timeout=600)
+                        progress, timeout=600, py=RITMO_PY)
     except Exception as e:
         msg = (str(e).strip().splitlines() or [""])[-1][-300:]
         print("ritmo non riuscito:", str(e)[-1500:], flush=True)
@@ -517,7 +518,7 @@ def cloudfix(job, inp):
                 b64 = base64.b64encode(fh.read()).decode()
             out = handler({"id": job.get("id"), "input": {"audio_b64": b64, "filename": "mix.mp3",
                            "model": inp.get("model") or "htdemucs_6s", "bitrate": 128, "voices": True, "rhythm": True,
-                           "transcribe": bool(todo.get("asr", True)), "language": lang}})
+                           "transcribe": bool(todo.get("asr", True)), "asr": inp.get("asr"), "language": lang}})
             if not out or out.get("error"):
                 return {"error": "separazione: " + str((out or {}).get("error"))[-400:]}
             say("Carico le tracce nuove nel cloud")
